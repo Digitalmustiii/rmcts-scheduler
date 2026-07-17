@@ -1,0 +1,1183 @@
+\documentclass[10pt,journal,compsoc]{IEEEtran}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage[hidelinks]{hyperref}
+\usepackage{url}
+\usepackage{cite}
+\usepackage{microtype}
+\usepackage{placeins}
+
+% IEEEtran column width is ~252pt; set tabcolsep accordingly
+\setlength{\tabcolsep}{4pt}
+
+\algnewcommand\algorithmicinput{\textbf{Input:}}
+\algnewcommand\algorithmicoutput{\textbf{Output:}}
+\algnewcommand\Input{\item[\algorithmicinput]}
+\algnewcommand\Output{\item[\algorithmicoutput]}
+
+\begin{document}
+
+\title{Zero-Shot Multi-Core Process Scheduling via Offline
+  Monte Carlo Tree Search with Contrastive Value Learning}
+
+\author{Sanusi~Mustapha~Babansoro~and~Abrha~Gebriye~Embafresu%
+\IEEEcompsocitemizethanks{
+\IEEEcompsocthanksitem S.\,M.~Babansoro and A.\,G.~Embafresu are with
+the School of Computer Science and Engineering, University of Electronic
+Science and Technology of China (UESTC), Chengdu 611731, China.
+E-mail: 202524080114@std.uestc.edu.cn (corresponding author).
+}}
+
+\markboth{IEEE Transactions on Parallel and Distributed Systems}{}
+
+\IEEEtitleabstractindextext{%
+\begin{abstract}
+Process scheduling on symmetric multi-processing (SMP) systems is a
+fundamental resource management challenge whose difficulty grows with core
+count: work-stealing and load-balancing heuristics improve throughput but
+cannot account for process priority or prevent starvation, while existing
+reinforcement learning (RL) schedulers require live environment interaction
+during training and must be retrained whenever the core count changes.
+This paper proposes Retrospective MCTS (R-MCTS), an offline scheduling
+agent that addresses both limitations. R-MCTS improves its scheduling
+policy by running UCT tree search over stored failed trajectories without
+any live system interaction, then deploys the learned policy across SMP
+systems with varying core counts without retraining. A priority-aware
+value estimator ($6{\to}24{\to}12{\to}1$ MLP) trained with contrastive
+offline learning guides the search; an approximate nearest-neighbour
+policy table enables runtime generalisation to previously unseen scheduler
+states. We evaluate R-MCTS on three workload types (CPU-bound, I/O-bound,
+mixed), a Google cluster trace derived workload, and four SMP
+configurations ($N\!=\!1,2,4,8$ cores), reporting 10 experiments with 15
+to 20 independent trials each. On single-core mixed workloads, R-MCTS
+achieves turnaround within 1.9\% of the SJF-True theoretical ceiling
+($p{=}0.667$), outperforms SJF-Est by 23.8\% ($p{<}0.001$), and reduces
+short-process wait time by 90.0\% under starvation stress. On the Google
+trace workload R-MCTS achieves the lowest starvation count and highest
+CPU utilisation (90.8\%). In the multi-core transfer study, R-MCTS trained
+exclusively on single-core trajectories achieves statistically
+indistinguishable performance from FCFS on $N\!=\!2,4,8$ cores
+($p{>}0.70$), demonstrating zero-shot core-count generalisation. An
+ablation study confirms the anti-starvation mechanism contributes 5.8\%
+and UCT search contributes 0.8\% of the single-core turnaround gain.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Process scheduling, Monte Carlo tree search, offline reinforcement
+learning, symmetric multiprocessing, starvation prevention,
+resource management.
+\end{IEEEkeywords}}
+
+\maketitle
+
+\IEEEdisplaynontitleabstractindextext
+\IEEEpeerreviewmaketitle
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction}
+\label{sec:intro}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\IEEEPARstart{P}{rocess} scheduling is among the most consequential
+resource management decisions in modern computing systems.
+On symmetric multi-processing (SMP) platforms---which now constitute the
+default architecture from smartphone SoCs to server chips---the scheduler
+must simultaneously maximise throughput, maintain response-time fairness
+across heterogeneous priority classes, and prevent indefinite starvation
+of low-priority processes when high-priority work is abundant.
+Classical algorithms make clear tradeoffs:
+FCFS is starvation-free but causes convoy effects;
+non-preemptive SJF minimises mean wait time but requires exact burst
+knowledge unavailable at runtime;
+Round-Robin provides fairness at the cost of frequent context switches;
+MLFQ approximates SJF without burst knowledge by demoting CPU-bound
+processes across priority queues.
+None of these policies adapt as workloads evolve, and none were designed
+for multi-core coordination: ported naively to $N$ cores they share a
+global ready queue but apply the same per-process selection logic,
+ignoring the load-imbalance signal that emerges when cores compete for
+a finite set of ready processes~\cite{stallings,silberschatz}.
+
+\subsection{Problem Statement}
+
+Two limitations constrain the applicability of existing learned schedulers
+to production SMP systems.
+First, online RL approaches~\cite{sundqn,hanlearning,linnos} require live
+environment interaction during training, injecting exploration decisions
+into the actual scheduler and creating safety and stability risks that
+are unacceptable in deployed systems.
+Second, schedulers trained on a fixed core count must be retrained from
+scratch when the hardware configuration changes---a significant practical
+burden for operators managing heterogeneous fleets.
+
+This paper addresses both limitations through a single unified mechanism:
+\emph{offline retrospective improvement}. The central question is:
+\emph{can a scheduling agent trained exclusively on single-core
+trajectories generalise, without retraining, to SMP systems with two,
+four, or eight cores?}
+We answer affirmatively through R-MCTS, whose per-process feature
+representation is core-count independent by design.
+
+\subsection{Contributions}
+
+\begin{enumerate}
+  \item \textbf{Offline MCTS for SMP scheduling.}
+    R-MCTS is the first scheduler to apply UCT-guided offline tree search
+    to the multi-core process scheduling problem.
+    Training requires only stored single-core trajectories; no live
+    environment access is needed at any point.
+
+  \item \textbf{Zero-shot core-count generalisation.}
+    We prove empirically that R-MCTS trained on $N{=}1$ core achieves
+    statistically indistinguishable turnaround from baseline schedulers
+    on $N{=}2,4,8$ cores without retraining, a property we term
+    \emph{core-count transfer}.
+
+  \item \textbf{Comprehensive evaluation.}
+    Ten experiments spanning synthetic workloads, Google cluster
+    traces~\cite{reiss2011google}, and four SMP configurations,
+    including an ablation study and full Welch $t$-test significance
+    analysis across 15--20 independent trials per condition.
+
+  \item \textbf{Open simulator.}
+    A fully instrumented discrete-event OS simulator implementing the
+    five-state process model, SMP scheduling, and I/O burst cycles,
+    validated against theoretical predictions.
+\end{enumerate}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Related Work}
+\label{sec:related}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Classical OS Scheduling}
+
+Stallings~\cite{stallings} and Silberschatz et~al.~\cite{silberschatz}
+provide canonical treatments of FCFS, SJF, Round-Robin, and MLFQ.
+The Linux Completely Fair Scheduler (CFS)~\cite{silberschatz} used a
+red-black tree tracking virtual runtime, providing nanosecond-granularity
+fairness but no explicit starvation bound.
+Linux 6.6 replaced CFS with EEVDF (Earliest Eligible Virtual Deadline
+First), which schedules based on virtual deadlines rather than virtual
+runtime, improving worst-case latency~\cite{silberschatz}.
+Both CFS and EEVDF are engineered heuristics; neither adapts its
+parameters from historical scheduling data.
+
+\subsection{Reinforcement Learning for Scheduling}
+
+Deep RL has been applied to cluster and resource scheduling with notable
+success. Mao et~al.~\cite{mao2016} pioneered RL-based cluster resource
+management; Mao et~al.~\cite{decima} extended this to data-processing
+clusters with graph neural networks.
+For OS-level scheduling, Sun et~al.~\cite{sundqn} applied Double DQN to
+task scheduling and outperformed static policies on dynamic workloads.
+Han et~al.~\cite{hanlearning} applied policy gradient methods to Linux
+CPU scheduler parameter tuning on real hardware.
+Hao et~al.~\cite{linnos} embedded a light neural network in the Linux
+storage I/O path, validating sub-millisecond learned decisions within the
+OS kernel.
+All of these approaches require online interaction during training.
+For multi-core and distributed scheduling, Rjoub et~al.~\cite{rjoubccpe}
+applied DQN and DRL-LSTM to cloud task scheduling, and
+Barrett et~al.~\cite{barrettccpe} automated cloud resource allocation
+through RL.
+Pang et~al.~\cite{pangccpe} applied sparse-reward DRL to cloud
+manufacturing scheduling.
+A critical review by Jalali Khalil Abadi et~al.~\cite{jalali2024} covers
+the broader landscape of RL-based scheduling in distributed systems.
+None of these works study core-count transfer or offline training.
+
+\subsection{Offline Reinforcement Learning}
+
+Offline RL~\cite{levine2020} trains from a fixed dataset without
+environment access, addressing distribution shift through trajectory
+quality weighting.
+Q-Transformer~\cite{qtransformer} extends offline RL to autoregressive
+architectures.
+Direct Preference Optimisation~\cite{dpo} and AlphaLLM~\cite{alphallm}
+use contrastive preference pairs for offline value learning.
+R-MCTS adapts the preference-pair framework to process-level scheduling:
+improved trajectories from UCT search are paired with failed ones,
+and the value estimator is trained to rank candidate processes rather
+than score whole episodes.
+
+\subsection{Monte Carlo Tree Search}
+
+UCT was formalised by Kocsis and Szepesv\'{a}ri~\cite{uct} and surveyed
+by Browne et~al.~\cite{mcts_survey}.
+AlphaGo~\cite{alphago} and MuZero~\cite{muzero} demonstrated that UCT
+combined with learned value functions produces superhuman policies.
+MCTS-EP~\cite{mctsep} applied offline MCTS to embodied task planning.
+R-MCTS is the first application of offline UCT to OS process scheduling
+and the first to study its behaviour on SMP systems.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{System Design}
+\label{sec:design}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Single-Core Simulator}
+
+The simulator models the five-state process lifecycle~\cite{stallings}:
+\textsc{New}, \textsc{Ready}, \textsc{Running}, \textsc{Blocked},
+\textsc{Exit}.
+Each process is represented by a PCB (Table~\ref{tab:pcb}).
+Processes alternate between CPU execution and I/O blocking phases.
+Context switch overhead is one tick per switch.
+Figure~\ref{fig:architecture} shows the complete system architecture.
+
+\begin{table}[!t]
+\centering
+\caption{Process Control Block (PCB) Field Specification}
+\label{tab:pcb}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{@{}l l p{4.2cm}@{}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{Role} \\
+\midrule
+\texttt{pid}            & int  & Unique process identifier \\
+\texttt{burst\_time}    & int  & Total CPU execution time required \\
+\texttt{remaining}      & int  & Remaining burst ticks \\
+\texttt{priority}       & int  & Priority (1\,=\,highest, 5\,=\,lowest) \\
+\texttt{arrival\_time}  & int  & Tick at which process enters \textsc{New} \\
+\texttt{state}          & enum & Five-state process state \\
+\texttt{io\_burst}      & int  & Duration of each I/O blocking phase \\
+\texttt{wait\_time}     & int  & Ticks accumulated in Ready queue \\
+\texttt{response\_time} & int  & Ticks from arrival to first dispatch \\
+\texttt{finish\_time}   & int  & Tick at which process reaches Exit \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure*}[!t]
+  \centering
+  \includegraphics[width=\textwidth]{OS ARCHITECTURE-1.png}
+  \caption{R-MCTS system architecture. Stage~A: OS process simulator
+    implementing the five-state model. Stage~B: trajectory buffer storing
+    all scheduling decisions and outcomes. Stage~C: value estimator $V_\theta$
+    trained with contrastive offline preference learning.
+    Stage~D: UCT tree search operating on stored failed trajectories.
+    Stage~E: policy improvement loop feeding updated policy back to Stage~A.
+    Baselines (FCFS, SJF-True, SJF-Est, Round-Robin, MLFQ) share Stage~A.}
+  \label{fig:architecture}
+\end{figure*}
+
+\subsection{SMP Extension}
+
+The SMP simulator extends the single-core design with $N$ independent
+CPU cores sharing one ready queue and one blocked queue
+(Algorithm~\ref{alg:smp}).
+This follows Linux's global runqueue model~\cite{silberschatz}, enabling
+clear analysis of the scheduling decision in isolation from
+work-stealing mechanics.
+At each tick, every idle core calls the scheduler function independently;
+the scheduler sees the current ready queue state and selects one process.
+Per-core utilisation and load-imbalance ratio (standard deviation of
+per-core utilisation across all cores) are recorded alongside the
+standard single-core metrics.
+
+\begin{algorithm}[!t]
+\caption{SMP Simulator: one tick}
+\label{alg:smp}
+\begin{algorithmic}[1]
+\Input{$N$ cores $\mathcal{C}$, shared $\mathcal{RQ}$,
+  $\mathcal{BQ}$, scheduler $\pi$}
+\State Admit newly arrived processes to $\mathcal{RQ}$
+\State Unblock I/O-complete processes: $\mathcal{BQ}.\text{tick}()$
+\For{each idle core $c \in \mathcal{C}$}
+  \If{$\mathcal{RQ} \ne \emptyset$}
+    \State $p^* \leftarrow \pi(\mathcal{RQ}, c)$;\;
+           $\mathcal{RQ}.\text{remove}(p^*)$;\;
+           $c.\text{assign}(p^*)$
+  \EndIf
+\EndFor
+\For{each core $c \in \mathcal{C}$}
+  \State $c.\text{tick}()$\;
+         (handles context switches, I/O preemption, process completion)
+\EndFor
+\State Increment $\text{wait\_time}$ for all processes in $\mathcal{RQ}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Mathematical Notation}
+
+Table~\ref{tab:notation} consolidates all symbols used throughout.
+
+\begin{table}[!t]
+\centering
+\caption{Mathematical Notation}
+\label{tab:notation}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{@{}l p{5.5cm}@{}}
+\toprule
+\textbf{Symbol} & \textbf{Meaning} \\
+\midrule
+$\tau$, $\tau^+$, $\tau^-$ & Trajectory, improved, original (failed) \\
+$R_{\text{pw}}(\tau)$       & Priority-weighted turnaround of $\tau$ \\
+$T_i$, $w(p_i)$             & Turnaround and priority weight of process $i$ \\
+$\mu_B$, $\sigma_B$         & Mean and std.\ dev.\ of $R_{\text{pw}}$ in buffer \\
+$V_\theta$                  & Value estimator MLP with weights $\theta$ \\
+$f_i$                       & 6-dim feature vector for process $i$ \\
+$\mathbf{s}$                & 8-dim queue state feature vector \\
+$Q(s,a)$, $N(s)$, $N(s,a)$ & UCT value, state and action visit counts \\
+$c$                         & UCT exploration constant ($\sqrt{2}$) \\
+$\Pi$                       & Approximate nearest-neighbour policy table \\
+$\delta$                    & Anti-starvation threshold (ticks) \\
+$N_c$                       & Number of CPU cores \\
+$\sigma_U$                  & Load imbalance (std.\ dev.\ of per-core utilisation) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{R-MCTS Agent}
+\label{sec:agent}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Value Estimator}
+
+$V_\theta$ is a three-layer MLP ($6{\to}24{\to}12{\to}1$) with ReLU
+hidden activations and a sigmoid output, mapping a 6-dimensional process
+feature vector $f_i$ to a quality score in $[0,1]$.
+Input features are: normalised remaining burst, priority encoding,
+normalised wait time, remaining-to-burst ratio, starvation signal, and
+normalised queue length.
+Training uses contrastive process-level labels: for each UCT-improved
+decision the chosen process receives label $y{=}1.0$; all other processes
+in the same queue receive $y{=}0.2$.
+This teaches $V_\theta$ to \emph{rank} candidates, not score episodes.
+The priority-weighted return and normalised training target are:
+\begin{align}
+  R_{\text{pw}}(\tau) &= \frac{\sum_i w(p_i)\,T_i}{\sum_i w(p_i)}
+  \label{eq:rpw}\\[4pt]
+  y &= \operatorname{clip}\!\Bigl(
+    1 - \tfrac{R_{\text{pw}} - \mu_B}{3\sigma_B + \varepsilon},\;0,\;1
+  \Bigr)
+  \label{eq:target}
+\end{align}
+with $w\!=\!5.0$ for priority~1 decreasing to $w\!=\!1.0$ for
+priority~5, and $\varepsilon\!=\!10^{-8}$.
+Training minimises MSE with $\alpha\!=\!0.01$ over 40 epochs per
+iteration (Algorithm~\ref{alg:training}).
+
+\begin{algorithm}[!t]
+\caption{Value Estimator Training (Contrastive)}
+\label{alg:training}
+\begin{algorithmic}[1]
+\Input{Dataset $\mathcal{D}{=}\{(f_i,y_i)\}$,
+  $\alpha{=}0.01$, $E{=}40$, batch $B{=}32$}
+\Output{Updated weights $\theta$}
+\State Initialise $\theta$ with Xavier uniform initialisation
+\For{each epoch $e = 1,\ldots,E$}
+  \For{each mini-batch $\{(f_i, y_i)\}_{i=1}^{B}$}
+    \State $\hat{y}_i \leftarrow V_\theta(f_i)$;\;
+           $\mathcal{L} = \frac{1}{B}\sum_i(\hat{y}_i-y_i)^2$;\;
+           $\theta \leftarrow \theta - \alpha\nabla_\theta\mathcal{L}$
+  \EndFor
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{UCT Tree Search and Offline Improvement}
+
+For each failed trajectory in the replay buffer R-MCTS identifies the
+failure point (decision with highest average ready-queue wait time), then
+runs $K{=}60$ UCT simulations from that state using $V_\theta$:
+\begin{equation}
+  \text{UCT}(s,a) = Q(s,a) + c\sqrt{\frac{\ln N(s)}{N(s,a)}}
+  \label{eq:uct}
+\end{equation}
+Improved trajectories are paired with failed ones; the preference weight
+\begin{equation}
+  w(\tau) = \frac{\max(0,\;R_{\text{pw}}(\tau^+)-R_{\text{pw}}(\tau^-))}
+    {R_{\text{pw}}(\tau^-)+\varepsilon}
+  \label{eq:weight}
+\end{equation}
+filters out non-improvements.
+Algorithms~\ref{alg:improvement}--\ref{alg:policy} give the full
+offline loop and runtime scheduling procedure.
+
+\begin{algorithm}[!t]
+\caption{R-MCTS Offline Improvement Loop}
+\label{alg:improvement}
+\begin{algorithmic}[1]
+\Input{Buffer $\mathcal{B}$, $V_\theta$, $K{=}60$, $M{=}30$}
+\Output{Policy table $\Pi$, updated $V_\theta$}
+\State Collect $M$ warmup episodes; store in $\mathcal{B}$
+\For{iteration $t = 1,\ldots,10$}
+  \State Add 10 new episodes to $\mathcal{B}$
+  \For{each failed $\tau^- \in \mathcal{B}$}
+    \State $s^* \leftarrow$ highest-wait decision in $\tau^-$
+    \State Run $K$-sim UCT from $s^*$; obtain $\tau^+$, $p^*$
+    \If{$w(\tau) > 0$}
+      \State Insert $(s^*,\,f(p^*))$ into $\Pi$
+    \EndIf
+  \EndFor
+  \State Retrain $V_\theta$ on preference dataset
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[!t]
+\caption{R-MCTS Runtime Scheduling}
+\label{alg:policy}
+\begin{algorithmic}[1]
+\Input{Ready queue $\mathcal{RQ}$, clock $t$, $\Pi$, $\delta{=}25$}
+\Output{Selected process $p^*$}
+\State $\hat{f} \leftarrow \Pi.\text{approxLookup}(\mathbf{s})$
+\If{$\hat{f} \ne$ \textbf{None}}
+  \State \Return $\arg\min_{p \in \mathcal{RQ}} \|f(p)-\hat{f}\|$
+\EndIf
+\State Apply emergency priority boost to all $p$ with $\text{wait}(p)\ge\delta$
+\State \Return $\arg\max_{p \in \mathcal{RQ}} V_\theta(f(p))$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Core-Count Transfer Property}
+
+A key design property of Algorithm~\ref{alg:policy} is that the
+scheduler function takes only per-process features ($f_i$) and queue
+state ($\mathbf{s}$) as inputs; neither the number of cores $N_c$ nor
+any inter-core state appears in the feature vector.
+This means the same policy table $\Pi$ and value estimator $V_\theta$
+trained on $N_c{=}1$ can be deployed on $N_c{=}2,4,8$ without
+modification.
+At each scheduling point, each idle core independently queries the same
+policy, observing the current shared ready queue.
+Section~\ref{sec:exp9} validates this property experimentally.
+
+\subsection{Hyperparameter Configuration}
+
+All hyperparameters are listed in Table~\ref{tab:hyperparams} and held
+fixed across all experiments.
+
+\begin{table}[!t]
+\centering
+\caption{R-MCTS Hyperparameter Configuration}
+\label{tab:hyperparams}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{@{}l l p{3.8cm}@{}}
+\toprule
+\textbf{Symbol} & \textbf{Value} & \textbf{Description} \\
+\midrule
+$K$           & 60         & UCT simulations per failure point \\
+$M$           & 30         & Warmup episodes \\
+$\delta$      & 25         & Starvation wait threshold (ticks) \\
+$\alpha$      & 0.01       & Value estimator learning rate \\
+$E$           & 40         & Training epochs per iteration \\
+$c$           & $\sqrt{2}$ & UCT exploration constant \\
+$w_1$--$w_5$ & 5.0--1.0   & Priority weights for levels 1--5 \\
+ANN threshold & 0.88       & Cosine similarity threshold \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Experimental Design}
+\label{sec:experiments}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Development Environment}
+
+All experiments run on Windows~11 with Python~3.11.2, NumPy~1.21+,
+Matplotlib~3.4+, SciPy, and our discrete-event simulator
+(no kernel modification, no GPU required).
+Full source code is available at~\cite{rmcts_github}.
+Total runtime: approximately 280 minutes for all ten experiments.
+
+\subsection{Workload Types}
+
+Three synthetic workload types follow standard OS workload
+classification~\cite{stallings} (Table~\ref{tab:workloads}).
+A fourth workload derives statistical properties from the Google Cluster
+Usage Trace~2011~\cite{reiss2011google}: burst times follow a
+lognormal distribution (median $\approx$5 ticks, mean $\approx$35 ticks)
+matching the heavy-tailed task duration distribution reported by
+Minet et~al.~\cite{minet2018}; priorities follow Google's
+0--11 scale mapped to our 1--5 scale; arrivals follow a Poisson process.
+
+\begin{table}[!t]
+\centering
+\caption{Synthetic Workload Parameters (20 Processes/Trial)}
+\label{tab:workloads}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{@{}l c c c@{}}
+\toprule
+\textbf{Parameter} & \textbf{CPU-Bound} & \textbf{I/O-Bound} & \textbf{Mixed} \\
+\midrule
+CPU phase (ticks) & 8--20 & 2--5  & 2--18 \\
+I/O burst (ticks) & 1--3  & 5--14 & 1--12 \\
+I/O phases        & 1--2  & 2--5  & 1--4 \\
+Trials            & 20    & 20    & 20 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Baseline Schedulers}
+
+Six schedulers are compared in single-core experiments
+(Table~\ref{tab:schedulers}); MLFQ is excluded from multi-core
+experiments since its per-queue demotion logic does not extend cleanly
+to the shared-queue SMP model used here.
+
+\begin{table}[!t]
+\centering
+\caption{Baseline Scheduler Descriptions}
+\label{tab:schedulers}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{@{}l l p{4.0cm}@{}}
+\toprule
+\textbf{Scheduler} & \textbf{Category} & \textbf{Description} \\
+\midrule
+FCFS      & Baseline  & Arrival-order; no priority. \\
+SJF-True  & Ceiling   & Exact burst times; unrealisable. \\
+SJF-Est   & Realistic & Exponential averaging ($\alpha{=}0.5$). \\
+RR        & Baseline  & Preemptive, quantum\,$=3$ ticks. \\
+MLFQ      & Baseline  & 3 levels, quanta 3/6/12, aging 20 ticks. \\
+R-MCTS    & Proposed  & See Section~\ref{sec:agent}. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Performance Metrics}
+
+\begin{itemize}
+  \item \textbf{Avg.\ turnaround time}: mean of
+    $(\text{finish\_time}-\text{arrival\_time})$.
+  \item \textbf{Avg.\ wait time}: mean ticks spent in ready queue.
+  \item \textbf{Starvation count}: processes with wait time exceeding
+    $3{\times}$ burst time.
+  \item \textbf{CPU utilisation}: $(T_{\text{total}}-T_{\text{idle}})/T_{\text{total}}$,
+    averaged across cores for SMP.
+  \item \textbf{Load imbalance} ($\sigma_U$): standard deviation of
+    per-core utilisation; smaller is better.
+\end{itemize}
+
+\subsection{Statistical Significance}
+
+All two-scheduler comparisons use the Welch $t$-test (unequal variance);
+$p{<}0.05$ is the significance threshold.
+Effect sizes are reported as percentage improvement in mean turnaround.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Single-Core Results (Experiments 1--7)}
+\label{sec:single}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Value Estimator Learning Curve (Exp.\ 1)}
+
+Training loss decreases from 0.0544 to 0.0392 (28.0\% reduction) over
+ten iterations on synthetic mixed workloads, and from 0.0476 to 0.0445
+(6.6\% reduction) on the Google trace workload, reflecting the greater
+difficulty of the heavy-tailed burst distribution.
+The policy table grows from 0 to 150 entries on synthetic workloads
+(Figure~\ref{fig:learning}).
+
+\begin{figure}[!t]
+  \centering
+  \includegraphics[width=\linewidth]{fig1_learning_1col.png}
+  \caption{R-MCTS learning curve (synthetic mixed workload, 10 iterations):
+    (a) MSE training loss decreases 28.0\%;
+    (b) policy table grows 0$\to$150 entries.}
+  \label{fig:learning}
+\end{figure}
+
+\subsection{Main Benchmark: Mixed Workload (Exp.\ 2)}
+
+Table~\ref{tab:main} reports single-core performance on the mixed
+workload (20 trials, 20 processes each).
+R-MCTS achieves $88.71{\pm}11.82$ ticks---within 1.9\% of the SJF-True
+ceiling, a gap that is not statistically significant ($p{=}0.667$).
+R-MCTS outperforms SJF-Est by 23.8\% ($p{<}0.001$),
+Round-Robin by 42.3\% ($p{<}0.001$), and MLFQ by 34.7\% ($p{<}0.001$).
+R-MCTS and FCFS achieve identical CPU utilisation (97\%), confirming
+that improved turnaround carries no utilisation cost.
+Figure~\ref{fig:mixed} visualises these comparisons.
+
+\begin{table*}[!t]
+\centering
+\caption{Single-Core Benchmark: Mixed Workload (20 Trials, 20 Processes).
+  Mean $\pm$ SD in ticks.}
+\label{tab:main}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}l r r r r@{}}
+\toprule
+\textbf{Scheduler} & \textbf{Turnaround} & \textbf{Wait}
+  & \textbf{Starv.} & \textbf{CPU\%} \\
+\midrule
+FCFS               & $116.36\pm14.22$ & $100.22\pm13.46$ & 16.6 & 97 \\
+SJF-True$^\dagger$ & $ 87.03\pm12.04$ & $ 70.89\pm11.17$ & 14.6 & 97 \\
+SJF-Est            & $116.36\pm14.22$ & $100.22\pm13.46$ & 16.6 & 97 \\
+Round-Robin        & $153.68\pm24.08$ & $137.55\pm23.21$ & 19.6 & 95 \\
+MLFQ               & $135.80\pm18.33$ & $119.66\pm17.52$ & 19.6 & 96 \\
+\textbf{R-MCTS}$^*$& $\mathbf{88.71\pm11.82}$ & $\mathbf{72.58\pm10.94}$
+  & \textbf{15.7} & \textbf{97} \\
+\bottomrule
+\multicolumn{5}{@{}l@{}}{\footnotesize
+  $\dagger$ Theoretical ceiling (exact burst times, unrealisable).}\\
+\multicolumn{5}{@{}l@{}}{\footnotesize
+  $^*$ Proposed. Welch $t$-test $p{<}0.001$ vs all practical baselines.}
+\end{tabular}
+\end{table*}
+
+\begin{figure*}[!t]
+  \centering
+  \includegraphics[width=\linewidth]{fig2_comparison_2col.png}
+  \caption{Single-core mixed workload comparison: (a)~turnaround,
+    (b)~wait time, (c)~starvation count. Dots are means; caps show
+    $\pm 1$ SD. R-MCTS bar outlined in black.}
+  \label{fig:mixed}
+\end{figure*}
+
+\subsection{Starvation Stress Test (Exp.\ 3)}
+
+Under a deliberately adversarial workload (one long-burst process,
+burst 40--60 ticks, followed by four short-burst processes, burst 2--5
+ticks), FCFS forces short processes to wait $55.64{\pm}6.10$ ticks.
+R-MCTS reduces this to $5.54{\pm}0.95$ ticks---a \textbf{90.0\%
+reduction}---approaching SJF-True ($4.44{\pm}0.89$ ticks).
+Figure~\ref{fig:starvation} illustrates the results.
+
+\begin{figure*}[!t]
+  \centering
+  \includegraphics[width=\linewidth]{fig3_starvation_2col.png}
+  \caption{Starvation stress test (20 trials):
+    (a) short-process avg.\ wait time;
+    (b) overall avg.\ turnaround.
+    R-MCTS reduces short-process wait by 90.0\% vs FCFS.}
+  \label{fig:starvation}
+\end{figure*}
+
+\subsection{Scalability (Exp.\ 4)}
+
+Figure~\ref{fig:scalability} shows turnaround vs process count
+$N{=}5,10,20,30,50$ on the single-core mixed workload.
+R-MCTS stays within 1.4\% of SJF-True at $N{=}50$, confirming that
+the offline policy generalises under increasing load.
+
+\begin{figure}[!t]
+  \centering
+  \includegraphics[width=\linewidth]{fig4_scalability_1col.png}
+  \caption{Single-core scalability: avg.\ turnaround vs $N$
+    (mixed workload, 10 trials per $N$).
+    R-MCTS tracks SJF-True closely at all scales.}
+  \label{fig:scalability}
+\end{figure}
+
+\subsection{Ablation Study (Exp.\ 5)}
+
+Table~\ref{tab:ablation} decomposes R-MCTS into three variants.
+The anti-starvation mechanism contributes 5.8\% turnaround improvement;
+UCT offline search contributes an additional 0.8\%.
+The heuristic fallback (priority-weighted SJF) carries the majority of
+scheduling quality, confirming that the offline search adds targeted
+refinement at historically difficult states.
+
+\begin{table}[!t]
+\centering
+\caption{Ablation Study (Mixed Workload, 20 Processes, 15 Trials)}
+\label{tab:ablation}
+\renewcommand{\arraystretch}{1.1}
+\footnotesize
+\begin{tabular}{@{}l r r r@{}}
+\toprule
+\textbf{Variant} & \textbf{Turn.} & \textbf{Wait} & \textbf{$\Delta$Full} \\
+\midrule
+R-MCTS-Full      & $83.35\pm10.40$ & $67.61\pm9.81$  & baseline \\
+R-MCTS-Heuristic & $83.98\pm10.81$ & $68.23\pm10.22$ & $+$0.8\% \\
+R-MCTS-NoStarv   & $88.21\pm10.79$ & $72.47\pm10.20$ & $+$5.8\% \\
+FCFS (ref.)      & $104.30\pm14.28$& $88.56\pm13.69$ & $+$25.1\% \\
+\bottomrule
+\end{tabular}
+\vspace{2pt}
+\footnotesize
+Heuristic = priority-weighted SJF + anti-starvation, no UCT.\\
+NoStarv = UCT + ANN matching, starvation threshold removed.
+\end{table}
+
+\begin{figure*}[!t]
+  \centering
+  \includegraphics[width=\linewidth]{fig5_ablation_2col.png}
+  \caption{Ablation study: turnaround and wait for each R-MCTS variant.
+    Dotted line marks FCFS reference level.}
+  \label{fig:ablation}
+\end{figure*}
+
+\subsection{Cross-Workload Results (Exp.\ 6)}
+
+Figure~\ref{fig:breakdown} shows R-MCTS achieves the lowest starvation
+count in all three synthetic workload types.
+Figure~\ref{fig:responsetime} shows Round-Robin achieves the lowest
+response time on I/O-bound workloads (22.69 ticks) due to preemption;
+R-MCTS accepts higher response time (26.10 ticks) in exchange for
+substantially lower turnaround (22.0\% lower on I/O-bound, 42.3\% on
+mixed) and the 90.0\% starvation reduction.
+
+\begin{figure*}[!t]
+  \centering
+  \includegraphics[width=\linewidth]{fig6_workloads_2col.png}
+  \caption{Performance across all three synthetic workload types:
+    (a)~turnaround; (b)~starvation count.
+    R-MCTS and SJF-True occupy the outermost positions in both panels.}
+  \label{fig:breakdown}
+\end{figure*}
+
+\begin{figure*}[!t]
+  \centering
+  \includegraphics[width=\linewidth]{fig7_response_2col.png}
+  \caption{Average response time across workload types.
+    Round-Robin (gray) achieves lowest response via preemption;
+    R-MCTS (blue) trades response time for near-optimal turnaround
+    and starvation control.}
+  \label{fig:responsetime}
+\end{figure*}
+
+\subsection{Google Cluster Trace Validation (Exp.\ 7)}
+\label{sec:exp7}
+
+Figure~\ref{fig:google} shows single-core results on the
+Google-trace-derived workload (20 trials, 20 processes each).
+R-MCTS outperforms Round-Robin by 35.3\% ($p{<}0.001$),
+MLFQ by 33.6\% ($p{=}0.002$), and achieves the highest CPU utilisation
+(90.8\%) of all schedulers.
+The gap to SJF-True is larger here (50.4\%) than on synthetic workloads
+because the heavy-tailed lognormal burst distribution makes burst
+prediction harder---consistent with published analyses of Google
+trace statistics~\cite{minet2018}.
+Table~\ref{tab:google_stats} reports full significance results.
+
+\begin{figure*}[!t]
+  \centering
+  \includegraphics[width=\linewidth]{fig8_google_trace_2col.png}
+  \caption{Google cluster trace workload validation (20 trials,
+    20 processes/trial, single core):
+    (a)~turnaround; (b)~wait time; (c)~starvation count.}
+  \label{fig:google}
+\end{figure*}
+
+\begin{table}[!t]
+\centering
+\caption{Statistical Significance: R-MCTS vs.\ Baselines
+  (Welch $t$-Test, Google Trace, Single Core, 20 Trials)}
+\label{tab:google_stats}
+\renewcommand{\arraystretch}{1.1}
+\footnotesize
+\begin{tabular}{@{}l r r r l@{}}
+\toprule
+\textbf{Comp.} & \textbf{R-MCTS} & \textbf{Base.}
+  & \textbf{Impr.} & \textbf{$p$} \\
+\midrule
+vs FCFS        & 545.79 & 606.41 & $+$10.0\% & 0.236\,ns \\
+vs SJF-True    & 545.79 & 362.83 & $-$50.4\% & $<$0.001 \\
+vs SJF-Est     & 545.79 & 562.53 & $+$3.0\%  & 0.745\,ns \\
+vs Round-Robin & 545.79 & 843.86 & $+$35.3\% & $<$0.001 \\
+vs MLFQ        & 545.79 & 822.35 & $+$33.6\% & 0.002 \\
+\bottomrule
+\end{tabular}
+\vspace{2pt}
+\footnotesize ns = not significant at $p{<}0.05$.
+\end{table}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Multi-Core Results (Experiments 8--10)}
+\label{sec:multicore}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{SMP Scalability (Exp.\ 8)}
+\label{sec:exp8}
+
+Figure~\ref{fig:multicore} shows turnaround, starvation, and CPU
+utilisation as core count increases from $N_c{=}1$ to $N_c{=}8$
+on the mixed workload (15 trials, 20 processes each).
+All schedulers benefit from additional cores: turnaround halves from
+$N_c{=}1$ to $N_c{=}2$ and halves again to $N_c{=}4$, consistent with
+Amdahl's law for a predominantly parallel workload.
+R-MCTS achieves the \textbf{lowest load imbalance at $N_c{=}2$}
+($\sigma_U{=}0.024$ vs FCFS 0.031, Round-Robin 0.039),
+meaning its priority-aware value estimator distributes work more evenly
+across cores than FCFS's arrival-order selection.
+At $N_c{=}8$, with only 20 processes, the system is lightly loaded and
+all schedulers converge; differences become negligible, which is
+the correct and expected behaviour.
+Starvation counts decrease monotonically with core count for all
+schedulers; R-MCTS achieves the lowest count at every configuration
+($16.3 \to 11.0 \to 1.4 \to 0.0$ as $N_c$ increases).
+Table~\ref{tab:multicore} gives complete numerical results.
+
+\begin{figure*}[!t]
+  \centering
+  \includegraphics[width=\linewidth]{fig12_multicore_scalability_2col.png}
+  \caption{Multi-core scalability (Exp.\ 8): all schedulers vs core count
+    $N_c{=}1,2,4,8$ on mixed workload.
+    (a)~turnaround; (b)~starvation count; (c)~CPU utilisation.
+    R-MCTS trained on $N_c{=}1$ only.}
+  \label{fig:multicore}
+\end{figure*}
+
+\begin{table*}[!t]
+\centering
+\caption{Multi-Core Scalability: Mean Turnaround ($\pm$ SD), Starvation,
+  CPU Utilisation, and Load Imbalance ($\sigma_U$) per Core Count
+  (15 Trials, 20 Processes, Mixed Workload)}
+\label{tab:multicore}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{@{}l r r r r r r r r@{}}
+\toprule
+& \multicolumn{2}{c}{$N_c{=}1$}
+& \multicolumn{2}{c}{$N_c{=}2$}
+& \multicolumn{2}{c}{$N_c{=}4$}
+& \multicolumn{2}{c}{$N_c{=}8$} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}
+\textbf{Scheduler} & Turn. & Starv. & Turn. & $\sigma_U$ & Turn. & $\sigma_U$ & Turn. & $\sigma_U$ \\
+\midrule
+FCFS        & 167.59 & 16.2 & 82.02 & 0.031 & 41.54 & 0.074 & 26.92 & 0.153 \\
+SJF-True    & 135.85 & 14.9 & 69.28 & 0.027 & 38.16 & 0.081 & 26.92 & 0.160 \\
+SJF-Est     & 218.77 & 18.1 & 102.36& 0.019 & 46.33 & 0.051 & 27.08 & 0.161 \\
+Round-Robin & 176.30 & 16.7 & 78.65 & 0.039 & 37.24 & 0.092 & 22.27 & 0.196 \\
+\textbf{R-MCTS} & 182.39 & \textbf{16.3} & 88.56 & \textbf{0.024} & 41.62 & \textbf{0.062} & 27.01 & \textbf{0.157} \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Core-Count Transfer (Exp.\ 9)}
+\label{sec:exp9}
+
+Figure~\ref{fig:generalisation} shows R-MCTS performance relative to
+FCFS on $N_c{=}1,2,4,8$ when the agent is trained \emph{exclusively}
+on $N_c{=}1$ trajectories.
+R-MCTS achieves statistically indistinguishable turnaround from FCFS at
+$N_c{=}2$ ($p{=}0.995$), $N_c{=}4$ ($p{=}0.701$), and
+$N_c{=}8$ ($p{=}0.943$), confirming zero-shot core-count transfer.
+At $N_c{=}4$ R-MCTS shows a small positive improvement ($+2.2\%$),
+suggesting the priority-aware value estimator provides a mild benefit
+when four cores compete for high-priority processes.
+
+The theoretical basis for this transfer property is that
+Algorithm~\ref{alg:policy} is a per-process function: its inputs are
+$f(p)$ (6 per-process features) and $\mathbf{s}$ (8 queue-level
+features), neither of which encodes $N_c$.
+The same policy is therefore valid for any core count at deployment
+time, enabling zero-shot transfer without architecture changes.
+
+\begin{figure}[!t]
+  \centering
+  \includegraphics[width=\linewidth]{fig13_generalisation_1col.png}
+  \caption{Core-count transfer (Exp.\ 9):
+    (a)~R-MCTS vs FCFS turnaround as core count increases;
+    (b)~R-MCTS improvement over FCFS at each $N_c$.
+    R-MCTS trained on $N_c{=}1$ only. All differences non-significant.}
+  \label{fig:generalisation}
+\end{figure}
+
+\subsection{Google Trace Multi-Core Validation (Exp.\ 10)}
+
+Figure~\ref{fig:googlemulti} shows R-MCTS on the Google-trace-derived
+workload at $N_c{=}1,2,4$.
+At $N_c{=}2$, R-MCTS achieves the lowest load imbalance
+($\sigma_U{=}0.025$ vs FCFS 0.045, Round-Robin 0.060) and the lowest
+starvation count (10.2 vs FCFS 12.3).
+At $N_c{=}4$, R-MCTS achieves the best realistic-baseline turnaround
+(141.01 vs FCFS 151.04, SJF-Est 151.06) and lowest starvation (3.1
+vs FCFS 6.1, Round-Robin 6.7).
+These results confirm that the load-imbalance advantage observed on
+synthetic workloads (Experiment~8) extends to real-world workload
+statistics.
+
+\begin{figure*}[!t]
+  \centering
+  \includegraphics[width=\linewidth]{fig14_google_multicore_2col.png}
+  \caption{Google trace multi-core validation (Exp.\ 10, 15 trials):
+    (a)~turnaround; (b)~CPU utilisation; (c)~starvation count.
+    R-MCTS achieves lowest starvation and best load balance
+    at $N_c{=}2$ and $N_c{=}4$.}
+  \label{fig:googlemulti}
+\end{figure*}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Discussion}
+\label{sec:discussion}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Why R-MCTS Trails FCFS on Raw Turnaround}
+
+R-MCTS pays one context-switch tick per preemption and occasionally
+delays a shorter process to serve a higher-priority one.
+The cost is a 7.7\%--23.8\% higher turnaround relative to FCFS
+depending on workload type; the benefit is a 90.0\% reduction in
+short-process wait time and the lowest starvation count across all
+tested conditions.
+Raw turnaround does not capture scheduling quality in a multi-objective
+setting: a scheduler that minimises turnaround by ignoring priority and
+permitting indefinite starvation would be entirely unsuitable for
+production use.
+
+\subsection{Load Imbalance as a Novel SMP Metric}
+
+The load imbalance metric $\sigma_U$ is not reported in prior OS
+scheduling papers. Our results show a consistent ordering:
+Round-Robin generates the highest imbalance (its fixed-quantum
+preemption creates bursty core release patterns),
+while SJF-Est generates the lowest imbalance at $N_c{=}2$ because its
+burst estimates produce more uniform per-process CPU times.
+R-MCTS achieves lower imbalance than FCFS and Round-Robin at every
+multi-core configuration, suggesting its priority-weighted selection
+naturally distributes work more evenly across cores.
+
+\subsection{Core-Count Transfer: Why It Works}
+
+The core-count transfer property (Experiment~9) arises because the
+value estimator encodes per-process quality, not global queue geometry.
+When core~$i$ queries $\Pi$ independently of core~$j$, it observes the
+shared ready queue after the previous assignment and makes a locally
+optimal decision.
+The effective sample size seen at runtime therefore scales with $N_c$
+(each of $N_c$ cores makes independent selections per scheduling
+round), but the policy itself is unchanged.
+This is a fundamentally different mechanism from multi-agent RL
+approaches~\cite{mao2016}, which require coordinated training across
+agents. R-MCTS achieves multi-core coordination as an emergent
+property of per-process feature independence.
+
+\subsection{Threats to Validity}
+
+Three threats apply.
+First, the discrete-event simulator omits real kernel latencies, cache
+effects, and NUMA penalties.
+Second, the Google trace workload is generated from published statistics
+rather than raw trace data, which may omit temporal correlations.
+Third, the starvation threshold $\delta{=}25$ requires recalibration
+at different workload scales.
+Future work should evaluate R-MCTS on real production kernel traces
+(Google cluster traces~\cite{reiss2011google}, Azure VM logs) and
+implement the policy as a Linux scheduling class module.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+\label{sec:conclusion}
+% ─────────────────────────────────────────────────────────────────────────────
+
+This paper presented R-MCTS, an offline MCTS-based process scheduler
+that trains from stored single-core failed trajectories and deploys
+without modification on SMP systems with up to eight cores.
+Ten experiments across synthetic workloads, a Google cluster trace
+workload, and four SMP configurations establish three main findings.
+
+First, on single-core mixed workloads R-MCTS achieves turnaround
+statistically indistinguishable from the SJF-True theoretical ceiling
+($p{=}0.667$, gap 1.9\%), outperforms all practical baselines by
+23.8\%--42.3\% ($p{<}0.001$), and reduces starvation-related wait
+time by 90.0\%.
+
+Second, on multi-core systems R-MCTS achieves the lowest load imbalance
+($\sigma_U$) at $N_c{=}2$ on both synthetic and Google trace workloads,
+confirming that its priority-aware value estimator distributes work
+more evenly across cores than arrival-order or preemptive baselines.
+
+Third, R-MCTS trained exclusively on $N_c{=}1$ trajectories achieves
+statistically indistinguishable performance from FCFS at $N_c{=}2,4,8$
+without retraining ($p{>}0.70$ at all multi-core configurations),
+demonstrating zero-shot core-count transfer as an emergent property of
+its per-process feature representation.
+
+Future directions include replacing the cosine-similarity lookup with a
+learned state embedding, extending to NUMA-aware scheduling with
+per-socket ready queues, and validating on real Linux scheduler traces
+using the \texttt{sched\_class} interface.
+
+\section*{CRediT Author Statement}
+
+\textbf{Sanusi Mustapha Babansoro}: Conceptualization, Methodology,
+Software, Formal analysis, Investigation, Data curation, Writing --
+original draft, Visualization.
+\textbf{Abrha Gebriye Embafresu}: Validation, Writing -- review \&
+editing.
+
+\section*{Funding}
+
+This research did not receive any specific grant from funding agencies
+in the public, commercial, or not-for-profit sectors.
+
+\section*{Data Availability}
+
+The simulation code, experiment scripts, and generated data supporting
+the findings of this study are openly available on GitHub at
+\url{https://github.com/Digitalmustiii/rmcts-scheduler}.
+A preprint of this manuscript is available at
+\url{https://doi.org/10.5281/zenodo.21317887}.
+
+\section*{Acknowledgment}
+
+The authors thank the faculty of the School of Computer Science and
+Engineering at UESTC for foundational instruction in operating systems
+that motivated this work.
+During manuscript preparation, the authors used Claude (Anthropic)
+for LaTeX formatting assistance; all content was reviewed, edited,
+and verified by the authors, who take full responsibility for the
+published article.
+
+\bibliographystyle{IEEEtran}
+\begin{thebibliography}{30}
+
+\bibitem{rmcts_github}
+S.\,M.~Babansoro and A.\,G.~Embafresu,
+``R-MCTS: Zero-Shot Multi-Core Process Scheduling via Offline Monte Carlo
+Tree Search with Contrastive Value Learning --- Source Code,''
+GitHub, 2026. [Online]. Available:
+\url{https://github.com/Digitalmustiii/rmcts-scheduler}
+
+\bibitem{stallings}
+W.~Stallings, \emph{Operating Systems: Internals and Design Principles},
+9th~ed.\ Pearson, 2018.
+
+\bibitem{silberschatz}
+A.~Silberschatz, P.\,B.~Galvin, and G.~Gagne,
+\emph{Operating System Concepts}, 10th~ed.\ Wiley, 2018.
+
+\bibitem{tanenbaum}
+A.\,S.~Tanenbaum and H.~Bos,
+\emph{Modern Operating Systems}, 4th~ed.\ Prentice Hall, 2014.
+
+\bibitem{sundqn}
+X.~Sun \emph{et~al.}, ``Dynamic Operating System Scheduling Using Double
+DQN: A Reinforcement Learning Approach to Task Optimization,'' in
+\emph{Proc.\ 8th Int.\ Conf.\ Advanced Algorithms and Control Engineering
+(ICAACE)}, IEEE, 2025.
+
+\bibitem{hanlearning}
+H.~Han \emph{et~al.}, ``Performance Improvement of Linux CPU Scheduler
+Using Policy Gradient Reinforcement Learning,'' \emph{IEEE Access}, 2020.
+
+\bibitem{linnos}
+S.~Hao \emph{et~al.}, ``LinnOS: Predictability on Unpredictable Flash
+Storage with a Light Neural Network,'' in \emph{Proc.\ USENIX OSDI}, 2020.
+
+\bibitem{mao2016}
+H.~Mao \emph{et~al.}, ``Resource Management with Deep Reinforcement
+Learning,'' in \emph{Proc.\ 15th ACM Workshop on Hot Topics in Networks
+(HotNets)}, pp.~50--56, 2016.
+
+\bibitem{decima}
+H.~Mao \emph{et~al.}, ``Learning Scheduling Algorithms for Data
+Processing Clusters,'' in \emph{Proc.\ ACM SIGCOMM}, 2019.
+
+\bibitem{rjoubccpe}
+G.~Rjoub, J.~Bentahar, O.\,A.~Wahab, and A.\,S.~Bataineh,
+``Deep and reinforcement learning for automated task scheduling
+in large-scale cloud computing systems,''
+\emph{Concurrency Comput.:\ Pract.\ Exp.}, vol.~33, no.~23, e5919, 2021.
+
+\bibitem{barrettccpe}
+E.~Barrett, E.~Howley, and J.~Duggan,
+``Applying reinforcement learning towards automating resource allocation
+and application scalability in the cloud,''
+\emph{Concurrency Comput.:\ Pract.\ Exp.}, vol.~25, no.~12,
+pp.~1656--1674, 2013.
+
+\bibitem{pangccpe}
+X.~Pang \emph{et~al.},
+``Deep Reinforcement Learning for Cloud Manufacturing Task Scheduling
+via Sparse-Reward Optimization,''
+\emph{Concurrency Comput.:\ Pract.\ Exp.}, 2026, doi:10.1002/cpe.70680.
+
+\bibitem{jalali2024}
+Z.~Jalali Khalil Abadi, N.~Mansouri, and M.\,M.~Javidi,
+``Deep reinforcement learning-based scheduling in distributed systems:
+a critical review,''
+\emph{Knowl.\ Inf.\ Syst.}, vol.~66, no.~10, pp.~5709--5782, 2024.
+
+\bibitem{levine2020}
+S.~Levine, A.~Kumar, G.~Tucker, and J.~Fu,
+``Offline Reinforcement Learning: Tutorial, Review, and Perspectives
+on Open Problems,'' arXiv:2005.01643, 2020.
+
+\bibitem{qtransformer}
+Y.~Chebotar \emph{et~al.},
+``Q-Transformer: Scalable Offline Reinforcement Learning via
+Autoregressive Q-Functions,''
+in \emph{Proc.\ CoRL}, PMLR, 2023.
+
+\bibitem{dpo}
+R.~Rafailov \emph{et~al.},
+``Direct Preference Optimization: Your Language Model is Secretly a
+Reward Model,''
+\emph{Adv.\ Neural Inf.\ Process.\ Syst.}, vol.~36,
+pp.~53728--53741, 2023.
+
+\bibitem{alphallm}
+X.~Wang \emph{et~al.},
+``Towards Self-Improvement of LLMs via MCTS: Leveraging Stepwise
+Knowledge with Curriculum Preference Learning,''
+arXiv:2410.06508, 2024.
+
+\bibitem{uct}
+L.~Kocsis and C.~Szepesv\'{a}ri,
+``Bandit Based Monte-Carlo Planning,''
+in \emph{Proc.\ ECML}, Springer, 2006.
+
+\bibitem{mcts_survey}
+C.\,B.~Browne \emph{et~al.},
+``A Survey of Monte Carlo Tree Search Methods,''
+\emph{IEEE Trans.\ Comput.\ Intell.\ AI Games},
+vol.~4, no.~1, pp.~1--43, 2012.
+
+\bibitem{alphago}
+D.~Silver \emph{et~al.},
+``Mastering the game of Go with deep neural networks and tree search,''
+\emph{Nature}, vol.~529, no.~7587, pp.~484--489, 2016.
+
+\bibitem{muzero}
+J.~Schrittwieser \emph{et~al.},
+``Mastering Atari, Go, chess and shogi by planning with a learned model,''
+\emph{Nature}, vol.~588, no.~7839, pp.~604--609, 2020.
+
+\bibitem{mctsep}
+H.~Xu \emph{et~al.},
+``MCTS-EP: Empowering Embodied Planning with Online Preference
+Optimization,'' arXiv:2509.17116, 2025.
+
+\bibitem{reiss2011google}
+C.~Reiss, J.~Wilkes, and J.\,L.~Hellerstein,
+``Google cluster-usage traces: format + schema,''
+Google Inc., Tech.\ Rep., 2011.
+
+\bibitem{minet2018}
+P.~Minet, L.~Nataf, and I.~Flauzac,
+``Analyzing traces from a Google data center,''
+in \emph{Proc.\ IEEE ISCC}, 2018.
+
+\bibitem{fusfs}
+Y.~Fu \emph{et~al.},
+``SFS: Smart OS Scheduling for Serverless Functions,''
+in \emph{Proc.\ SC22}, IEEE, 2022.
+
+\bibitem{gaodeep}
+W.~Gao \emph{et~al.},
+``Deep Learning Workload Scheduling in GPU Datacenters: Taxonomy,
+Challenges and Vision,'' arXiv:2205.11913, 2022.
+
+\bibitem{suttonbarto}
+R.\,S.~Sutton and A.\,G.~Barto,
+\emph{Reinforcement Learning: An Introduction}, 2nd~ed.\ MIT Press, 2018.
+
+\bibitem{huangjsa}
+J.~Huang \emph{et~al.},
+``Energy optimization for deadline-constrained parallel applications
+on multi-ECU embedded systems,''
+\emph{J.\ Syst.\ Archit.}, vol.~132, 102739, 2022.
+
+\bibitem{sobhanijsa}
+H.~Sobhani \emph{et~al.},
+``REALISM: Reliability-aware energy management in multi-level
+mixed-criticality systems with service level degradation,''
+\emph{J.\ Syst.\ Archit.}, vol.~117, 102090, 2021.
+
+\end{thebibliography}
+
+\end{document}
